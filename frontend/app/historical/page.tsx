@@ -804,6 +804,7 @@ export default function HistoricalPage() {
           underlying={selectedUnderlying ?? null}
           liveTick={null}
           historicalRange={{ from: historyRangeFrom, to: historyRangeTo }}
+          historicalCandles={spotCandles}
           historicalResolution={spotResolution(resolution)}
           historicalSelectedTime={selectedTime}
           onHistoricalTimeSelect={selectReplayTime}

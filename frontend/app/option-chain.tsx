@@ -53,6 +53,10 @@ type Chain = {
   putOi: number | null;
   indiaVix: { ltp: number | null; change: number | null; changePercent: number | null } | null;
   options: OptionLeg[];
+  dataStatus: "live" | "stale" | "closed" | "unavailable";
+  marketStatus: string | null;
+  lastUpdatedAt: string | null;
+  dataError: string | null;
 };
 type StrikeRow = { strike: number; call: OptionLeg | null; put: OptionLeg | null };
 type OptionColumn =
@@ -209,6 +213,18 @@ function parseChain(value: unknown): Chain {
         }
       : null,
     options,
+    dataStatus:
+      value.data_status === "live" ||
+      value.data_status === "stale" ||
+      value.data_status === "closed" ||
+      value.data_status === "unavailable"
+        ? value.data_status
+        : "unavailable",
+    marketStatus:
+      typeof value.market_status === "string" ? value.market_status : null,
+    lastUpdatedAt:
+      typeof value.last_updated_at === "string" ? value.last_updated_at : null,
+    dataError: typeof value.data_error === "string" ? value.data_error : null,
   };
 }
 
@@ -510,7 +526,13 @@ function GreekCell({ value, digits = 3 }: { value: number | null; digits?: numbe
   return <td className={styles.greekCell}>{formatNumber(value, digits)}</td>;
 }
 
-export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRequest }) {
+export default function OptionChainWorkspace({
+  apiRequest,
+  refreshIntervalSeconds,
+}: {
+  apiRequest: ApiRequest;
+  refreshIntervalSeconds: number;
+}) {
   const [symbols, setSymbols] = useState<Underlying[]>([]);
   const [symbol, setSymbol] = useState<Underlying | null>(null);
   const [chain, setChain] = useState<Chain | null>(null);
@@ -592,10 +614,17 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
   }
 
   const loadChain = useCallback(
-    async (underlying: Underlying, selectedExpiry?: string, centerAtm = false) => {
+    async (
+      underlying: Underlying,
+      selectedExpiry?: string,
+      centerAtm = false,
+      silent = false,
+    ) => {
       const version = ++requestVersion.current;
-      setLoadingChain(true);
-      setError("");
+      if (!silent) {
+        setLoadingChain(true);
+        setError("");
+      }
       const query = new URLSearchParams({ symbol: underlying.symbol });
       if (selectedExpiry) query.set("timestamp", selectedExpiry);
       let loaded = false;
@@ -613,7 +642,21 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
           throw new Error("The market-data service returned a different option expiry than requested.");
         }
         loaded = true;
-        setStreamWarning("");
+        setStreamWarning(
+          response.dataStatus === "live"
+            ? ""
+            : response.dataError
+              ? `${response.dataError} Last successful update: ${
+                  response.lastUpdatedAt
+                    ? new Date(response.lastUpdatedAt).toLocaleTimeString()
+                    : "unavailable"
+                }.`
+              : `Option-chain data is ${response.dataStatus}; last successful update: ${
+                  response.lastUpdatedAt
+                    ? new Date(response.lastUpdatedAt).toLocaleTimeString()
+                    : "unavailable"
+                }.`,
+        );
         oiBaselinesRef.current = new Map(
           response.options.map((leg) => [
             leg.symbol,
@@ -632,15 +675,26 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
         }
         setChain(result);
         setExpiry(result.selectedExpiry ?? result.expiries[0]?.timestamp ?? "");
+        return result;
       } catch (caught) {
         if (version !== requestVersion.current) return;
-        setError(
-          (caught instanceof Error ? caught.message : "Unable to load the option chain.")
-            .replace(/\bfyers\b/gi, "market data service"),
-        );
+        const message = (
+          caught instanceof Error ? caught.message : "Unable to load the option chain."
+        ).replace(/\bfyers\b/gi, "market data service");
+        if (silent) {
+          setChain((current) =>
+            current
+              ? { ...current, dataStatus: "stale", dataError: message }
+              : current,
+          );
+          setStreamWarning(`${message} The displayed option chain may be stale.`);
+        } else {
+          setError(message);
+        }
+        return null;
       } finally {
         if (version === requestVersion.current) {
-          setLoadingChain(false);
+          if (!silent) setLoadingChain(false);
           if (centerAtm && loaded) {
             setCenterAtmRequest((request) => request + 1);
           }
@@ -676,6 +730,45 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
       active = false;
     };
   }, [apiRequest, loadChain]);
+
+  useEffect(() => {
+    if (
+      symbol?.symbol !== "NSE:NIFTY50-INDEX" ||
+      !chain?.selectedExpiry ||
+      expiry !== chain.selectedExpiry
+    ) {
+      return;
+    }
+
+    let active = true;
+    let timer = 0;
+    const refresh = async () => {
+      const requestStartedAt = performance.now();
+      const updated = await loadChain(
+        symbol,
+        chain.selectedExpiry ?? undefined,
+        false,
+        true,
+      );
+      if (!active) return;
+      const delay = updated?.dataStatus === "closed"
+        ? 60_000
+        : Math.max(
+            0,
+            Math.min(5, Math.max(1, refreshIntervalSeconds)) * 1000 -
+              (performance.now() - requestStartedAt),
+          );
+      timer = window.setTimeout(() => void refresh(), delay);
+    };
+    timer = window.setTimeout(
+      () => void refresh(),
+      Math.min(5, Math.max(1, refreshIntervalSeconds)) * 1000,
+    );
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [chain?.selectedExpiry, expiry, loadChain, refreshIntervalSeconds, symbol]);
 
   const strikeRows = useMemo(() => {
     const rows = new Map<number, StrikeRow>();
@@ -818,11 +911,19 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
     return [...new Set([symbol.symbol, ...optionSymbols.slice(0, 199)])];
   }, [atmStrike, chain?.options, symbol, visibleStrikeRows]);
   const hasChain = chain !== null && chain.selectedExpiry === expiry;
+  const isSharedDefaultNifty =
+    symbol?.symbol === "NSE:NIFTY50-INDEX" &&
+    hasChain &&
+    chain.expiries[0]?.timestamp === chain.selectedExpiry;
   const streamSymbolsKey = streamSymbols.join(",");
   const streamSymbolsRef = useRef<string[]>(streamSymbols);
 
   useEffect(() => {
     if (!symbol || !expiry || !hasChain) return;
+    if (isSharedDefaultNifty) {
+      pendingLiveTicksRef.current.clear();
+      return;
+    }
     const selectedSymbol = symbol;
     let cancelled = false;
     let reconnectTimer = 0;
@@ -979,7 +1080,7 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
       }
       if (streamSocketRef.current === socket) streamSocketRef.current = null;
     };
-  }, [apiRequest, expiry, hasChain, symbol]);
+  }, [apiRequest, expiry, hasChain, isSharedDefaultNifty, symbol]);
 
   useEffect(() => {
     streamSymbolsRef.current = streamSymbolsKey ? streamSymbolsKey.split(",") : [];
@@ -1160,12 +1261,19 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
           className={styles.refreshButton}
           type="button"
           disabled={!symbol || loadingChain}
-          title="Live updates arrive over the market stream. Use this button to reload the chain manually."
+          title={isSharedDefaultNifty
+            ? "Reload the shared server snapshot. It refreshes at the configured interval."
+            : "Reload the server snapshot. Contract price updates also arrive over the backend market stream."}
           onClick={() => symbol && void loadChain(symbol, expiry || undefined)}
         >
           <span aria-hidden="true">↻</span> {loadingChain ? "Updating…" : "Refresh chain"}
         </button>
-        {streamStatus !== "disconnected" && (
+        {isSharedDefaultNifty ? (
+          <span className={`${styles.streamStatus} ${styles.streamStatus_connected}`} role="status">
+            <span aria-hidden="true" />
+            Server snapshot every {Math.min(5, Math.max(1, refreshIntervalSeconds))}s
+          </span>
+        ) : streamStatus !== "disconnected" && (
           <span className={`${styles.streamStatus} ${styles[`streamStatus_${streamStatus}`]}`} aria-live="polite">
             <span aria-hidden="true" />
             {streamStatus === "connected"
@@ -1179,6 +1287,17 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
         )}
         {streamWarning && (
           <span className={styles.streamWarning} role="status">{streamWarning}</span>
+        )}
+        {chain && (
+          <span
+            className={chain.dataStatus === "live" ? styles.streamStatus_connected : styles.streamWarning}
+            role="status"
+          >
+            Server chain {chain.dataStatus}
+            {chain.lastUpdatedAt
+              ? ` · ${new Date(chain.lastUpdatedAt).toLocaleTimeString()}`
+              : ""}
+          </span>
         )}
       </div>
       <div className={styles.tableHeader}>
@@ -1364,7 +1483,7 @@ export default function OptionChainWorkspace({ apiRequest }: { apiRequest: ApiRe
         key={symbol?.symbol ?? "no-underlying"}
         apiRequest={apiRequest}
         underlying={symbol}
-        liveTick={liveSpotTick}
+        liveTick={isSharedDefaultNifty ? null : liveSpotTick}
       />
     </section>
   );

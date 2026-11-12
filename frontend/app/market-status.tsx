@@ -65,7 +65,7 @@ export default function MarketStatus({ apiRequest }: { apiRequest: ApiRequest })
         className={`${styles.marketStatus} ${
           status === "OPEN"
             ? styles.marketStatus_open
-            : status
+            : status && status !== "UNKNOWN" && status !== "UNAVAILABLE"
               ? styles.marketStatus_closed
               : styles.marketStatus_unavailable
         }`}
@@ -75,7 +75,11 @@ export default function MarketStatus({ apiRequest }: { apiRequest: ApiRequest })
       >
         <span aria-hidden="true" />
         {status
-          ? `NSE F&O · ${status.replace(/_/g, " ")}`
+          ? status === "UNKNOWN"
+            ? "NSE F&O · CHECKING AT 9:16 AM IST"
+            : status === "UNAVAILABLE"
+              ? "NSE F&O · STATUS UNAVAILABLE TODAY"
+              : `NSE F&O · ${status.replace(/_/g, " ")}`
           : loading
             ? "Checking NSE F&O market…"
             : "NSE F&O market status unavailable"}

@@ -1,8 +1,8 @@
 """Persistence models for authentication."""
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -76,4 +76,19 @@ class FyersOAuthState(Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class FyersFeedSettings(Base):
+    __tablename__ = "fyers_feed_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    refresh_interval_seconds: Mapped[int] = mapped_column(
+        default=5, server_default="5"
+    )
+    market_status_checked_on: Mapped[date | None] = mapped_column(Date)
+    market_status: Mapped[str | None] = mapped_column(String(32))
+    api_requests_date: Mapped[date | None] = mapped_column(Date)
+    api_requests_today: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
     )

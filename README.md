@@ -156,13 +156,46 @@ second-largest distinct displayed values yellow; ties in displayed values use
 the same highlight. The table also shows intrinsic value
 and time-value decomposition derived from FYERS spot, strike, and quoted LTP.
 
-NSE F&O market status is read from FYERS `/data/marketStatus` and refreshed
-once per minute; the application does not infer it from a local weekday or
-clock schedule. Every authenticated user can view this status, including
-accounts whose license activation is pending; access to option-chain and other
-market data remains license-gated. Cached option-chain snapshots and quotes
-remain available for up to 24 hours while the backend process is running; a
-backend restart clears that in-memory cache.
+NSE F&O market status is requested from FYERS `/data/marketStatus` once per
+trading weekday at or after 9:16 AM IST and before 3:30 PM IST. The check date
+and result are stored in the database, so application restarts do not trigger
+another request that day. Before 9:16 AM the status is shown as pending; after
+3:30 PM and on weekends it is treated as closed without a provider request.
+Every authenticated user can view this status, including accounts whose
+license activation is pending; access to option-chain and other market data
+remains license-gated.
+
+While the market is open, the backend fetches the NIFTY 50 default-expiry chain
+once per configured interval (1–5 seconds, default 5) and shares that snapshot
+with all users. The administrator changes this interval in the Market Data
+connection panel. Users poll the backend for the shared snapshot; they do not
+each trigger a FYERS request. The poller stops fetching outside regular trading
+hours or when FYERS reports the market closed at the daily check. A special
+early market close after the 9:16 check is not detected until 3:30 PM. Other
+underlyings and manually selected non-default expiries remain on-demand and
+their quote updates use the shared backend WebSocket feed. The default NIFTY
+chain does not apply faster WebSocket ticks over the shared snapshot, so its
+displayed option and spot values change with the configured server snapshot.
+
+History requests with identical parameters are shared for five minutes, and
+expired-data responses are shared for one day. The floating spot chart fetches
+history only while open; the historical workspace reuses the spot candles it
+already loaded. FYERS 429 responses are not retried immediately: the backend
+honors `Retry-After` when supplied, pauses market-data requests during the
+cooldown, and labels cached chains as stale with their last successful update.
+
+The poller and its live snapshot are process-local. Run a single backend worker
+so multiple application workers do not independently poll FYERS. The stated
+Standard-plan quota is 5,000 requests per day. At a 5-second interval, NIFTY
+alone can use about 4,500 option-chain calls in a 6-hour-15-minute session,
+leaving about 500 requests for all other FYERS endpoints; a 1-second interval
+can use about 22,500 and exceed the quota. The admin Market Data panel shows
+the current IST day's FYERS REST request attempts, the 5,000-request limit, and
+the remaining balance. The persistent counter includes failed REST attempts,
+but excludes WebSocket ticks, cached responses, and the public symbol-master
+download. Tracking starts with deployment and does not backfill requests made
+earlier that day. It is a monitor only and does not stop requests at the quota,
+so choose the polling interval with the remaining endpoints in mind.
 
 FYERS Greeks and LTP remain provider values; this application does not predict
 or calculate LTP. Only the configured administrator can retrieve market data;
@@ -176,11 +209,11 @@ server-rendered pages without a light-theme flash. The default strike range
 shows 10 strikes either side of ATM, with options to show up to all 50 strikes
 either side.
 The authenticated FYERS data socket streams spot and option-contract quote
-updates into the page and chart without a page reload. The home page does not
-poll or reload the chain or chart history; use **Refresh chain** to manually
-retrieve the latest full snapshot, including provider Greeks. Fields supplied
-in FYERS symbol ticks update as ticks arrive. The WebSocket URL defaults to the
-same host on port 8000; set `NEXT_PUBLIC_API_WS_URL` when the API uses a
+updates into the page and chart without a page reload. The NIFTY default-expiry
+snapshot refreshes from the shared backend at the administrator-selected
+interval, including provider Greeks; other chains can be refreshed on demand.
+WebSocket tick updates apply to non-default chains. The WebSocket URL defaults
+to the same host on port 8000; set `NEXT_PUBLIC_API_WS_URL` when the API uses a
 different public URL.
 
 The shared underlying list includes the NIFTY 50 equity symbols and supported

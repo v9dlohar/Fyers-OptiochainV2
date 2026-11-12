@@ -19,7 +19,7 @@ from app.config import get_settings
 from app.db import Base, get_db
 from app.fyers import app_id_hash
 from app.main import app
-from app.models import BrokerConnection
+from app.models import BrokerConnection, FyersFeedSettings
 
 engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -40,6 +40,18 @@ def database(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     monkeypatch.setattr(fyers, "_shared_market_feed", fyers._SharedMarketFeed())
     monkeypatch.setattr(fyers, "_expired_contract_catalog_cache", {})
     monkeypatch.setattr(fyers, "_option_lot_size_cache", {})
+    monkeypatch.setattr(fyers, "_market_status_cache", None)
+    monkeypatch.setattr(fyers, "_fyers_cooldown_until", 0.0)
+    monkeypatch.setattr(fyers, "_default_chain_snapshot", None)
+    monkeypatch.setattr(fyers, "_default_chain_updated_at", None)
+    monkeypatch.setattr(fyers, "_default_chain_error", None)
+    monkeypatch.setattr(fyers, "_feed_refresh_interval_seconds", 5)
+    monkeypatch.setattr(fyers, "_option_chain_response_cache", fyers.OrderedDict())
+    monkeypatch.setattr(fyers, "_expired_response_cache", fyers.OrderedDict())
+    monkeypatch.setattr(fyers, "_history_response_cache", fyers.OrderedDict())
+    monkeypatch.setattr(fyers, "start_fyers_feed_poller", lambda: None)
+    monkeypatch.setattr(fyers, "stop_fyers_feed_poller", lambda: None)
+    monkeypatch.setattr(fyers, "SessionLocal", TestingSession)
     monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
     monkeypatch.setenv("FYERS_CLIENT_ID", "client-id")
     monkeypatch.setenv("FYERS_CLIENT_SECRET", "client-secret")
@@ -47,6 +59,9 @@ def database(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     monkeypatch.setenv("FYERS_ENCRYPTION_KEY", Fernet.generate_key().decode())
     get_settings.cache_clear()
     Base.metadata.create_all(engine)
+    with TestingSession() as db:
+        db.add(FyersFeedSettings(id=1, refresh_interval_seconds=5))
+        db.commit()
     app.dependency_overrides[get_db] = override_db
     yield
     app.dependency_overrides.clear()
@@ -240,12 +255,18 @@ def test_shared_market_feed_discards_stale_cached_quotes() -> None:
 def test_option_chain_falls_back_to_last_snapshot_and_live_quotes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        fyers, "_fyers_option_market_status", lambda _token, _db: {"status": "OPEN"}
+    )
     symbol = "NSE:NIFTY50-INDEX"
     expiry = "1790380800"
     option_symbol = "NSE:NIFTY2692625100CE"
     cached_snapshot = {
         "symbol": symbol,
-        "expiries": [{"date": "26-09-2026", "timestamp": expiry, "type": "W"}],
+        "expiries": [
+            {"date": "19-09-2026", "timestamp": "1790380700", "type": "W"},
+            {"date": "26-09-2026", "timestamp": expiry, "type": "W"},
+        ],
         "selected_expiry": expiry,
         "spot": 25000.0,
         "spot_change": 10.0,
@@ -329,6 +350,8 @@ def test_option_chain_falls_back_to_last_snapshot_and_live_quotes(
     assert payload["options"][0]["ltp"] == 125.0
     assert payload["options"][0]["volume"] == 150.0
     assert payload["options"][0]["oi"] == 1050.0
+    assert payload["data_status"] == "stale"
+    assert payload["data_error"] == "Provider unavailable"
 
 
 def test_shared_market_feed_shards_union_at_provider_symbol_limit() -> None:
@@ -460,6 +483,10 @@ def test_market_status_uses_fyers_nse_derivatives_segment(
         ],
     }
     requests: list[tuple[str, dict[str, str]]] = []
+    current_time = {
+        "value": datetime(2026, 9, 25, 9, 15, tzinfo=fyers._FYERS_TIMEZONE)
+    }
+    monkeypatch.setattr(fyers, "_fyers_now", lambda: current_time["value"])
 
     class ProviderResponse:
         def raise_for_status(self) -> None:
@@ -492,6 +519,14 @@ def test_market_status_uses_fyers_nse_derivatives_segment(
                 )
             )
             db.commit()
+        with TestingSession() as db:
+            assert fyers._fyers_option_market_status(
+                "market-status-token", db
+            )["status"] == "UNKNOWN"
+        assert requests == []
+        current_time["value"] = datetime(
+            2026, 9, 25, 9, 16, tzinfo=fyers._FYERS_TIMEZONE
+        )
         response = client.get(
             "/admin/fyers/market-status",
             headers={"Authorization": "Bearer " + token},
@@ -507,6 +542,15 @@ def test_market_status_uses_fyers_nse_derivatives_segment(
     assert len(requests) == 1
     assert requests[0][0].endswith("/data/marketStatus")
     assert requests[0][1]["Authorization"] == "client-id:market-status-token"
+    with TestingSession() as db:
+        assert fyers._fyers_option_market_status(
+            "market-status-token", db
+        ) == response.json()
+        settings = db.get(fyers.FyersFeedSettings, 1)
+        assert settings is not None
+        assert settings.market_status_checked_on == current_time["value"].date()
+        assert settings.market_status == "CLOSED"
+    assert len(requests) == 1
 
 
 def test_pending_non_admin_can_read_market_status(
@@ -515,7 +559,7 @@ def test_pending_non_admin_can_read_market_status(
     monkeypatch.setattr(
         fyers,
         "_fyers_option_market_status",
-        lambda _access_token: {
+        lambda _access_token, _db: {
             "exchange": "NSE",
             "segment": "FO",
             "market_type": "NORMAL",
@@ -546,6 +590,260 @@ def test_pending_non_admin_can_read_market_status(
 
     assert response.status_code == 200
     assert response.json()["status"] == "CLOSED"
+
+
+def test_admin_can_change_shared_fyers_feed_interval() -> None:
+    with TestClient(app) as client:
+        token = _token(client, "admin@example.com")
+        authorization = {"Authorization": f"Bearer {token}"}
+        initial = client.get("/admin/fyers/feed-settings", headers=authorization)
+        updated = client.put(
+            "/admin/fyers/feed-settings",
+            headers=authorization,
+            json={"refresh_interval_seconds": 2},
+        )
+        current = client.get("/admin/fyers/feed-settings", headers=authorization)
+
+    assert initial.status_code == 200
+    assert initial.json() == {"refresh_interval_seconds": 5}
+    assert updated.status_code == 200
+    assert updated.json() == {"refresh_interval_seconds": 2}
+    assert current.json() == {"refresh_interval_seconds": 2}
+
+
+def test_admin_can_view_daily_fyers_api_usage_and_daily_reset() -> None:
+    today = datetime.now(fyers._FYERS_TIMEZONE).date()
+    with TestClient(app) as client:
+        token = _token(client, "admin@example.com")
+        authorization = {"Authorization": f"Bearer {token}"}
+        with TestingSession() as db:
+            settings = db.get(FyersFeedSettings, 1)
+            assert settings is not None
+            settings.api_requests_date = today
+            settings.api_requests_today = 4999
+            db.commit()
+        fyers._record_fyers_api_request()
+        usage = client.get("/admin/fyers/api-usage", headers=authorization)
+
+        with TestingSession() as db:
+            settings = db.get(FyersFeedSettings, 1)
+            assert settings is not None
+            settings.api_requests_date = today - timedelta(days=1)
+            settings.api_requests_today = 27
+            db.commit()
+        reset_usage = client.get("/admin/fyers/api-usage", headers=authorization)
+        member_token = _token(client, "member@example.com")
+        forbidden = client.get(
+            "/admin/fyers/api-usage",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+
+    assert usage.status_code == 200
+    assert usage.json() == {
+        "date": today.isoformat(),
+        "daily_limit": 5000,
+        "requests_used": 5000,
+        "requests_remaining": 0,
+    }
+    assert reset_usage.status_code == 200
+    assert reset_usage.json()["requests_used"] == 0
+    assert reset_usage.json()["requests_remaining"] == 5000
+    assert forbidden.status_code == 403
+
+
+def test_fyers_rest_request_counter_excludes_cached_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fyers.httpx,
+        "get",
+        lambda *args, **kwargs: httpx.Response(
+            200,
+            json={"s": "ok", "data": {"expiryData": [], "optionsChain": []}},
+            request=httpx.Request("GET", "https://api-t1.fyers.in/data/quotes"),
+        ),
+    )
+
+    first = fyers._fyers_data(
+        "quotes", {"symbols": "NSE:NIFTY50-INDEX"}, "access-token"
+    )
+    cached = fyers._fyers_data(
+        "quotes", {"symbols": "NSE:NIFTY50-INDEX"}, "access-token"
+    )
+    with TestingSession() as db:
+        settings = db.get(FyersFeedSettings, 1)
+
+    assert first == cached == {"expiryData": [], "optionsChain": []}
+    assert settings is not None
+    assert settings.api_requests_today == 1
+
+
+def test_shared_poller_keeps_successful_refreshes_on_interval_start_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 0.0}
+    delays: list[float] = []
+
+    class StopAfterOneWait:
+        stopped = False
+
+        def is_set(self) -> bool:
+            return self.stopped
+
+        def wait(self, delay: float) -> bool:
+            delays.append(delay)
+            self.stopped = True
+            return True
+
+    monkeypatch.setattr(fyers, "_feed_poller_stop", StopAfterOneWait())
+    monkeypatch.setattr(fyers.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(fyers, "_feed_interval", lambda _db: 5)
+
+    def refresh(_db: Session) -> str:
+        clock["now"] += 1.25
+        return "OPEN"
+
+    monkeypatch.setattr(fyers, "_refresh_default_chain_once", refresh)
+    fyers._fyers_feed_poller()
+
+    assert delays == [3.75]
+
+
+def test_shared_default_nifty_snapshot_ignores_faster_stream_quotes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = {
+        "selected_expiry": "20261231",
+        "expiries": [{"timestamp": "20261231"}],
+        "spot": 25000,
+        "options": [{"symbol": "NSE:NIFTY26DEC25000CE", "ltp": 100}],
+    }
+    monkeypatch.setattr(
+        fyers._shared_market_feed,
+        "latest_quote",
+        lambda symbol: {"ltp": 999} if symbol == "NSE:NIFTY50-INDEX" else {"ltp": 250},
+    )
+
+    default_snapshot = fyers._apply_option_chain_quotes(
+        "NSE:NIFTY50-INDEX", snapshot
+    )
+    other_expiry = fyers._apply_option_chain_quotes(
+        "NSE:NIFTY50-INDEX",
+        {**snapshot, "selected_expiry": "20270107"},
+    )
+
+    assert default_snapshot["spot"] == 25000
+    assert default_snapshot["options"][0]["ltp"] == 100
+    assert other_expiry["spot"] == 999
+    assert other_expiry["options"][0]["ltp"] == 250
+
+
+def test_fyers_429_response_pauses_followup_provider_requests() -> None:
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "120"},
+        json={"message": "rate limit"},
+        request=httpx.Request("GET", "https://api-t1.fyers.in/data/options-chain-v3"),
+    )
+    error = httpx.HTTPStatusError(
+        "too many requests", request=response.request, response=response
+    )
+
+    with pytest.raises(fyers.HTTPException) as limited:
+        fyers._raise_fyers_rate_limit(error, "option chain")
+    with pytest.raises(fyers.HTTPException) as paused:
+        fyers._ensure_fyers_api_available()
+
+    assert limited.value.status_code == 503
+    assert limited.value.headers == {"Retry-After": "120"}
+    assert paused.value.status_code == 503
+    assert int(paused.value.headers["Retry-After"]) > 0
+
+
+def test_daily_rate_limit_waits_for_next_weekday_market_open() -> None:
+    before_open = datetime(
+        2026, 9, 25, 8, 0, tzinfo=fyers._FYERS_TIMEZONE
+    )
+    after_open = datetime(
+        2026, 9, 25, 16, 0, tzinfo=fyers._FYERS_TIMEZONE
+    )
+
+    assert fyers._next_fyers_market_open(before_open) == datetime(
+        2026, 9, 25, 9, 15, tzinfo=fyers._FYERS_TIMEZONE
+    )
+    assert fyers._next_fyers_market_open(after_open) == datetime(
+        2026, 9, 28, 9, 15, tzinfo=fyers._FYERS_TIMEZONE
+    )
+
+
+def test_shared_nifty_poller_fetches_only_when_market_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    market_status = {"status": "CLOSED"}
+    provider_calls: list[tuple[str, dict[str, str]]] = []
+    chain_data = {
+        "expiryData": [
+            {"date": "26-09-2026", "expiry": "1790380800", "expiry_flag": "W"}
+        ],
+        "optionsChain": [],
+    }
+
+    monkeypatch.setattr(
+        fyers,
+        "_fyers_option_market_status",
+        lambda _token, _db: market_status.copy(),
+    )
+    monkeypatch.setattr(
+        fyers, "_get_access_token", lambda _connection, _db: "poller-token"
+    )
+    monkeypatch.setattr(
+        fyers,
+        "_fyers_data",
+        lambda endpoint, params, _token: (
+            provider_calls.append((endpoint, params.copy())) or chain_data
+        ),
+    )
+    with TestClient(app) as client:
+        token = _token(client, "admin@example.com")
+        cipher = Fernet(get_settings().fyers_encryption_key.encode())
+        with TestingSession() as db:
+            db.add(
+                BrokerConnection(
+                    provider="fyers",
+                    encrypted_access_token=cipher.encrypt(b"stored-token").decode(),
+                    connected_by_user_id=1,
+                )
+            )
+            db.commit()
+
+            assert fyers._refresh_default_chain_once(db) == "CLOSED"
+            assert provider_calls == []
+
+            market_status["status"] = "OPEN"
+            assert fyers._refresh_default_chain_once(db) == "OPEN"
+        response = client.get(
+            "/admin/fyers/option-chain",
+            params={"symbol": "NSE:NIFTY50-INDEX"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        market_status["status"] = "CLOSED"
+        closed_response = client.get(
+            "/admin/fyers/option-chain",
+            params={"symbol": "NSE:NIFTY50-INDEX"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert len(provider_calls) == 1
+    assert provider_calls[0] == (
+        "options-chain-v3",
+        {"symbol": "NSE:NIFTY50-INDEX", "strikecount": "50", "greeks": "1"},
+    )
+    assert fyers._default_chain_snapshot is not None
+    assert fyers._default_chain_snapshot["data_status"] == "live"
+    assert response.status_code == 200
+    assert response.json()["data_status"] == "live"
+    assert closed_response.status_code == 200
+    assert closed_response.json()["data_status"] == "closed"
 
 
 def test_state_is_one_time_and_tokens_are_not_disclosed(
@@ -845,6 +1143,11 @@ def test_profile_rejects_fyers_provider_error(
 def test_option_chain_returns_fyers_expiries_contracts_and_greeks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        fyers,
+        "_fyers_option_market_status",
+        lambda _token, _db: {"status": "OPEN"},
+    )
     provider_token = "options-access-token"
     expiry = "1790380800"
     discovery = {
@@ -1017,6 +1320,11 @@ def test_option_chain_rejects_mismatched_or_duplicate_contracts(
 def test_option_chain_rejects_unavailable_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        fyers,
+        "_fyers_option_market_status",
+        lambda _token, _db: {"status": "OPEN"},
+    )
     class ProviderResponse:
         def raise_for_status(self) -> None:
             return None
@@ -1121,8 +1429,19 @@ def test_history_returns_normalized_spot_candles(
             },
             headers={"Authorization": f"Bearer {token}"},
         )
+        repeated = client.get(
+            "/admin/fyers/history",
+            params={
+                "symbol": "NSE:NIFTY50-INDEX",
+                "resolution": "2",
+                "range_from": "2025-03-26",
+                "range_to": "2025-03-27",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
 
     assert response.status_code == 200
+    assert repeated.json() == response.json()
     assert response.json() == {
         "symbol": "NSE:NIFTY50-INDEX",
         "resolution": "2",
@@ -1152,6 +1471,7 @@ def test_history_returns_normalized_spot_candles(
     assert calls[0]["params"]["date_format"] == "1"
     assert calls[0]["params"]["cont_flag"] == "1"
     assert calls[0]["headers"]["Authorization"] == f"client-id:{provider_token}"
+    assert len(calls) == 1
     assert provider_token not in response.text
 
 
@@ -1902,14 +2222,17 @@ def test_market_stream_subscribes_valid_contracts_and_relays_ticks(
                     "symbols": [underlying, option_symbol],
                 }
             )
-            received = [websocket.receive_json() for _ in range(5)]
+            received = [websocket.receive_json() for _ in range(6)]
             ticks = [message for message in received if message.get("type") == "tick"]
             tick = next(
                 (message for message in ticks if message["ltp"] == 123.45), None
             )
             assert tick is not None, received
             assert tick["ltp"] == 123.45
-            assert {message["ltp"] for message in ticks} == {123.45, 400}
+            assert {message["ltp"] for message in ticks} == {
+                123.45,
+                400,
+            }, received
             assert not any(message.get("type") == "warning" for message in received)
 
             with client.websocket_connect("/admin/fyers/stream") as second_websocket:

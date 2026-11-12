@@ -12,7 +12,9 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import time as datetime_time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 import httpx
@@ -29,7 +31,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import case, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.auth import (
@@ -39,9 +41,9 @@ from app.auth import (
     password_updated_user,
 )
 from app.config import get_settings
-from app.db import get_db
-from app.models import BrokerConnection, FyersOAuthState, User
-from app.schemas import FyersStatus
+from app.db import SessionLocal, get_db
+from app.models import BrokerConnection, FyersFeedSettings, FyersOAuthState, User
+from app.schemas import FyersFeedSettingsUpdate, FyersStatus
 
 router = APIRouter(prefix="/admin/fyers", tags=["admin FYERS"])
 logger = logging.getLogger(__name__)
@@ -53,6 +55,54 @@ _option_lot_size_lock = threading.Lock()
 _option_lot_size_cache: dict[str, tuple[float, dict[str, int]]] = {}
 _OPTION_LOT_SIZE_CACHE_TTL = 3600
 _FYERS_FO_SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/{exchange}_FO_sym_master.json"
+_FYERS_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+_FYERS_DAILY_API_LIMIT = 5000
+_market_status_lock = threading.Lock()
+_market_status_cache: tuple[date, dict[str, str]] | None = None
+_fyers_cooldown_lock = threading.Lock()
+_fyers_cooldown_until = 0.0
+_default_chain_refresh_lock = threading.Lock()
+_default_chain_state_lock = threading.Lock()
+_default_chain_snapshot: dict | None = None
+_default_chain_updated_at: datetime | None = None
+_default_chain_error: str | None = None
+_feed_poller_stop = threading.Event()
+_feed_poller_thread: threading.Thread | None = None
+_feed_refresh_interval_seconds = 5
+_option_chain_response_lock = threading.Lock()
+_option_chain_response_cache: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
+_OPTION_CHAIN_RESPONSE_CACHE_TTL = 0.75
+_expired_response_lock = threading.Lock()
+_expired_response_cache: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
+_EXPIRED_RESPONSE_CACHE_TTL = 24 * 60 * 60
+_history_response_lock = threading.Lock()
+_history_response_cache: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
+_HISTORY_RESPONSE_CACHE_TTL = 5 * 60
+
+
+def _record_fyers_api_request() -> None:
+    today = datetime.now(_FYERS_TIMEZONE).date()
+    with SessionLocal() as db:
+        result = db.execute(
+            update(FyersFeedSettings)
+            .where(FyersFeedSettings.id == 1)
+            .values(
+                api_requests_date=today,
+                api_requests_today=case(
+                    (
+                        FyersFeedSettings.api_requests_date == today,
+                        FyersFeedSettings.api_requests_today + 1,
+                    ),
+                    else_=1,
+                ),
+            )
+        )
+        if result.rowcount != 1:
+            raise RuntimeError(
+                "Fyers feed settings are missing; run database migrations."
+            )
+        db.commit()
+
 
 FYERS_OPTION_UNDERLYINGS = (
     {"label": "NIFTY 50", "symbol": "NSE:NIFTY50-INDEX", "type": "Index"},
@@ -684,6 +734,8 @@ def _refresh_fyers_access_token(
 
         refresh_token = _decrypt_refresh_token(connection)
         try:
+            _ensure_fyers_api_available()
+            _record_fyers_api_request()
             response = httpx.post(
                 f"{settings.fyers_api_base_url.rstrip('/')}/api/v3/validate-refresh-token",
                 json={
@@ -699,6 +751,8 @@ def _refresh_fyers_access_token(
             response.raise_for_status()
             payload = response.json()
         except httpx.HTTPStatusError as error:
+            if error.response.status_code == 429:
+                _raise_fyers_rate_limit(error, "token refresh")
             logger.warning(
                 "FYERS token refresh was rejected with HTTP %s",
                 error.response.status_code,
@@ -761,11 +815,109 @@ def _number(value: object) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def _ensure_fyers_api_available() -> None:
+    with _fyers_cooldown_lock:
+        remaining = max(0, math.ceil(_fyers_cooldown_until - time.monotonic()))
+    if remaining:
+        raise HTTPException(
+            status_code=503,
+            detail="Fyers rate limit reached; market-data requests are paused.",
+            headers={"Retry-After": str(remaining)},
+        )
+
+
+def _next_fyers_market_open(now: datetime) -> datetime:
+    next_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now >= next_open:
+        next_open += timedelta(days=1)
+    while next_open.weekday() >= 5:
+        next_open += timedelta(days=1)
+    return next_open
+
+
+def _raise_fyers_rate_limit(error: httpx.HTTPStatusError, operation: str) -> None:
+    global _fyers_cooldown_until
+    response = error.response
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        delay = 300
+    else:
+        try:
+            delay = max(1, int(retry_after))
+        except ValueError:
+            try:
+                retry_time = parsedate_to_datetime(retry_after)
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=UTC)
+                delay = max(
+                    1,
+                    math.ceil((retry_time - datetime.now(UTC)).total_seconds()),
+                )
+            except (TypeError, ValueError, OverflowError):
+                delay = 300
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    provider_message = (
+        " ".join(
+            value
+            for value in body.values()
+            if isinstance(value, str)
+        ).lower()
+        if isinstance(body, dict)
+        else ""
+    )
+    daily_limit = "daily" in provider_message or "per day" in provider_message
+    if daily_limit:
+        now = datetime.now(_FYERS_TIMEZONE)
+        next_market_day = _next_fyers_market_open(now)
+        delay = max(delay, math.ceil((next_market_day - now).total_seconds()))
+    if not daily_limit:
+        delay = min(delay, 6 * 60 * 60)
+    with _fyers_cooldown_lock:
+        _fyers_cooldown_until = max(
+            _fyers_cooldown_until, time.monotonic() + delay
+        )
+    logger.warning(
+        "FYERS rate-limited %s; pausing requests for at least %s seconds",
+        operation,
+        delay,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail="Fyers rate limit reached; market-data requests are paused.",
+        headers={"Retry-After": str(delay)},
+    ) from error
+
+
 def _fyers_data(
     endpoint: str, params: dict[str, str], access_token: str
 ) -> dict:
+    key = (endpoint, tuple(sorted(params.items())))
+    with _option_chain_response_lock:
+        now = time.monotonic()
+        cached = _option_chain_response_cache.get(key)
+        if (
+            cached is not None
+            and now - cached[0] < _OPTION_CHAIN_RESPONSE_CACHE_TTL
+        ):
+            _option_chain_response_cache.move_to_end(key)
+            return copy.deepcopy(cached[1])
+        payload = _fetch_fyers_data(endpoint, params, access_token)
+        _option_chain_response_cache[key] = (time.monotonic(), copy.deepcopy(payload))
+        while len(_option_chain_response_cache) > 256:
+            _option_chain_response_cache.popitem(last=False)
+        return payload
+
+
+def _fetch_fyers_data(
+    endpoint: str, params: dict[str, str], access_token: str
+) -> dict:
+    _ensure_fyers_api_available()
     settings = get_settings()
     try:
+        _record_fyers_api_request()
         response = httpx.get(
             f"{settings.fyers_api_base_url.rstrip('/')}/data/{endpoint}",
             params=params,
@@ -776,6 +928,12 @@ def _fyers_data(
         )
         response.raise_for_status()
         payload = response.json()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 429:
+            _raise_fyers_rate_limit(error, endpoint)
+        raise HTTPException(
+            status_code=502, detail="FYERS market-data request failed"
+        ) from error
     except (httpx.HTTPError, ValueError) as error:
         raise HTTPException(
             status_code=502, detail="FYERS market-data request failed"
@@ -794,9 +952,100 @@ def _fyers_data(
     return data
 
 
-def _fyers_option_market_status(access_token: str) -> dict[str, str]:
+def _fyers_now() -> datetime:
+    return datetime.now(_FYERS_TIMEZONE)
+
+
+def _fyers_option_market_status(
+    access_token: str, db: Session
+) -> dict[str, str]:
+    global _market_status_cache
+    with _market_status_lock:
+        now = _fyers_now()
+        today = now.date()
+        if now.weekday() >= 5:
+            return _market_status_result("CLOSED")
+        if now.time() < datetime_time(9, 16):
+            return _market_status_result("UNKNOWN")
+        if now.time() >= datetime_time(15, 30):
+            return _market_status_result("CLOSED")
+
+        if _market_status_cache is not None and _market_status_cache[0] == today:
+            return _market_status_cache[1].copy()
+
+        settings = db.get(FyersFeedSettings, 1)
+        if settings is not None and settings.market_status_checked_on == today:
+            status = settings.market_status or "UNKNOWN"
+            result = _market_status_result(status)
+            _market_status_cache = (today, result)
+            return _effective_market_status(result, now)
+
+        if settings is None:
+            settings = FyersFeedSettings(id=1, refresh_interval_seconds=5)
+            db.add(settings)
+            db.commit()
+            db.refresh(settings)
+
+        result = db.execute(
+            update(FyersFeedSettings)
+            .where(
+                FyersFeedSettings.id == 1,
+                or_(
+                    FyersFeedSettings.market_status_checked_on.is_(None),
+                    FyersFeedSettings.market_status_checked_on != today,
+                ),
+            )
+            .values(market_status_checked_on=today, market_status="UNKNOWN")
+        )
+        db.commit()
+        if result.rowcount != 1:
+            db.refresh(settings)
+            cached = _market_status_result(settings.market_status or "UNKNOWN")
+            _market_status_cache = (today, cached)
+            return _effective_market_status(cached, now)
+
+        try:
+            _ensure_fyers_api_available()
+            status = _fetch_fyers_option_market_status(access_token)
+        except HTTPException:
+            settings = db.get(FyersFeedSettings, 1)
+            if settings is not None:
+                settings.market_status = "UNAVAILABLE"
+                db.commit()
+            unavailable = _market_status_result("UNAVAILABLE")
+            _market_status_cache = (today, unavailable)
+            raise
+
+        settings = db.get(FyersFeedSettings, 1)
+        if settings is not None:
+            settings.market_status = status["status"]
+            db.commit()
+        _market_status_cache = (today, status)
+        return _effective_market_status(status, now)
+
+
+def _market_status_result(status: str) -> dict[str, str]:
+    return {
+        "exchange": "NSE",
+        "segment": "FO",
+        "market_type": "NORMAL",
+        "status": status,
+    }
+
+
+def _effective_market_status(
+    status: dict[str, str], now: datetime
+) -> dict[str, str]:
+    result = status.copy()
+    if now.weekday() >= 5 or now.time() >= datetime_time(15, 30):
+        result["status"] = "CLOSED"
+    return result
+
+
+def _fetch_fyers_option_market_status(access_token: str) -> dict[str, str]:
     settings = get_settings()
     try:
+        _record_fyers_api_request()
         response = httpx.get(
             f"{settings.fyers_api_base_url.rstrip('/')}/data/marketStatus",
             headers={
@@ -807,6 +1056,8 @@ def _fyers_option_market_status(access_token: str) -> dict[str, str]:
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as error:
+        if error.response.status_code == 429:
+            _raise_fyers_rate_limit(error, "market status")
         logger.warning(
             "FYERS market-status request failed with HTTP %s",
             error.response.status_code,
@@ -854,12 +1105,7 @@ def _fyers_option_market_status(access_token: str) -> dict[str, str]:
             detail="FYERS did not return NSE derivatives market status",
         )
 
-    return {
-        "exchange": "NSE",
-        "segment": "FO",
-        "market_type": "NORMAL",
-        "status": status.strip().upper(),
-    }
+    return _market_status_result(status.strip().upper())
 
 
 def _normalize_expiries(value: object) -> list[dict[str, str]]:
@@ -1024,6 +1270,20 @@ def _apply_cached_quotes(symbol: str, snapshot: dict) -> dict:
     return result
 
 
+def _apply_option_chain_quotes(symbol: str, snapshot: dict) -> dict:
+    expiries = snapshot.get("expiries")
+    selected_expiry = snapshot.get("selected_expiry")
+    if (
+        symbol == "NSE:NIFTY50-INDEX"
+        and isinstance(expiries, list)
+        and expiries
+        and isinstance(expiries[0], dict)
+        and expiries[0].get("timestamp") == selected_expiry
+    ):
+        return copy.deepcopy(snapshot)
+    return _apply_cached_quotes(symbol, snapshot)
+
+
 @router.get("/login")
 def login_start(
     user: User = Depends(admin_user), db: Session = Depends(get_db)
@@ -1088,6 +1348,8 @@ def callback(
         "code": code,
     }
     try:
+        _ensure_fyers_api_available()
+        _record_fyers_api_request()
         response = httpx.post(
             f"{settings.fyers_api_base_url.rstrip('/')}/api/v3/validate-authcode",
             json=payload,
@@ -1096,6 +1358,8 @@ def callback(
         response.raise_for_status()
         provider_payload = response.json()
     except httpx.HTTPStatusError as error:
+        if error.response.status_code == 429:
+            _raise_fyers_rate_limit(error, "authorization exchange")
         detail = (
             "FYERS rejected the authorization exchange "
             f"(HTTP {error.response.status_code})"
@@ -1212,7 +1476,65 @@ def fyers_option_market_status(
         raise HTTPException(status_code=404, detail="FYERS is not connected")
 
     access_token = _get_access_token(connection, db)
-    return _fyers_option_market_status(access_token)
+    return _fyers_option_market_status(access_token, db)
+
+
+@router.get("/feed-settings")
+def fyers_feed_settings(
+    user: User = Depends(market_data_user), db: Session = Depends(get_db)
+) -> dict[str, int]:
+    del user
+    settings = db.get(FyersFeedSettings, 1)
+    return {
+        "refresh_interval_seconds": (
+            settings.refresh_interval_seconds if settings is not None else 5
+        )
+    }
+
+
+@router.put("/feed-settings")
+def update_fyers_feed_settings(
+    update: FyersFeedSettingsUpdate,
+    user: User = Depends(admin_user),
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    global _feed_refresh_interval_seconds
+    del user
+    settings = db.get(FyersFeedSettings, 1)
+    if settings is None:
+        settings = FyersFeedSettings(
+            id=1, refresh_interval_seconds=update.refresh_interval_seconds
+        )
+        db.add(settings)
+    else:
+        settings.refresh_interval_seconds = update.refresh_interval_seconds
+    db.commit()
+    _feed_refresh_interval_seconds = update.refresh_interval_seconds
+    return {"refresh_interval_seconds": settings.refresh_interval_seconds}
+
+
+@router.get("/api-usage")
+def fyers_api_usage(
+    user: User = Depends(admin_user), db: Session = Depends(get_db)
+) -> dict[str, int | str]:
+    del user
+    today = datetime.now(_FYERS_TIMEZONE).date()
+    settings = db.get(FyersFeedSettings, 1)
+    if settings is None:
+        raise HTTPException(
+            status_code=503, detail="Fyers feed settings are not initialized."
+        )
+    used = (
+        settings.api_requests_today
+        if settings.api_requests_date == today
+        else 0
+    )
+    return {
+        "date": today.isoformat(),
+        "daily_limit": _FYERS_DAILY_API_LIMIT,
+        "requests_used": used,
+        "requests_remaining": max(0, _FYERS_DAILY_API_LIMIT - used),
+    }
 
 
 @router.get("/profile")
@@ -1232,6 +1554,8 @@ def fyers_profile(
 
     settings = get_settings()
     try:
+        _ensure_fyers_api_available()
+        _record_fyers_api_request()
         response = httpx.get(
             f"{settings.fyers_api_base_url.rstrip('/')}/api/v3/profile",
             headers={
@@ -1241,6 +1565,12 @@ def fyers_profile(
         )
         response.raise_for_status()
         payload = response.json()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 429:
+            _raise_fyers_rate_limit(error, "profile")
+        raise HTTPException(
+            status_code=502, detail="FYERS profile request failed"
+        ) from error
     except (httpx.HTTPError, ValueError) as error:
         raise HTTPException(
             status_code=502, detail="FYERS profile request failed"
@@ -1256,8 +1586,34 @@ def fyers_profile(
 def _fyers_expired_data(
     endpoint: str, params: dict[str, str], access_token: str
 ) -> dict:
+    key = (endpoint, tuple(sorted(params.items())))
+    with _expired_response_lock:
+        now = time.monotonic()
+        expired = [
+            cache_key
+            for cache_key, (cached_at, _) in _expired_response_cache.items()
+            if now - cached_at >= _EXPIRED_RESPONSE_CACHE_TTL
+        ]
+        for cache_key in expired:
+            del _expired_response_cache[cache_key]
+        cached = _expired_response_cache.get(key)
+        if cached is not None:
+            _expired_response_cache.move_to_end(key)
+            return copy.deepcopy(cached[1])
+        payload = _fetch_fyers_expired_data(endpoint, params, access_token)
+        _expired_response_cache[key] = (time.monotonic(), copy.deepcopy(payload))
+        while len(_expired_response_cache) > 512:
+            _expired_response_cache.popitem(last=False)
+        return payload
+
+
+def _fetch_fyers_expired_data(
+    endpoint: str, params: dict[str, str], access_token: str
+) -> dict:
+    _ensure_fyers_api_available()
     settings = get_settings()
     try:
+        _record_fyers_api_request()
         response = httpx.get(
             f"{settings.fyers_api_base_url.rstrip('/')}/data/history/fno/expired/{endpoint}",
             params=params,
@@ -1267,6 +1623,8 @@ def _fyers_expired_data(
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as error:
+        if error.response.status_code == 429:
+            _raise_fyers_rate_limit(error, f"expired endpoint {endpoint}")
         response = error.response
         provider_message = ""
         try:
@@ -1553,7 +1911,9 @@ def option_chain_lot_sizes(
     for symbol in symbols:
         match = re.fullmatch(r"(NSE|BSE):[A-Za-z0-9&_-]+(?:CE|PE)", symbol)
         if match is None:
-            raise HTTPException(status_code=422, detail="Invalid option contract symbol")
+            raise HTTPException(
+                status_code=422, detail="Invalid option contract symbol"
+            )
         exchanges.add(match.group(1))
     master_lot_sizes = {
         exchange: _fyers_option_lot_sizes(exchange) for exchange in exchanges
@@ -1564,6 +1924,158 @@ def option_chain_lot_sizes(
             for symbol in symbols
         }
     }
+
+
+def _feed_interval(db: Session) -> int:
+    global _feed_refresh_interval_seconds
+    settings = db.get(FyersFeedSettings, 1)
+    if settings is not None:
+        _feed_refresh_interval_seconds = min(
+            5, max(1, settings.refresh_interval_seconds)
+        )
+    return _feed_refresh_interval_seconds
+
+
+def _default_chain_payload(market_status: str | None = None) -> dict | None:
+    with _default_chain_state_lock:
+        if _default_chain_snapshot is None:
+            return None
+        result = copy.deepcopy(_default_chain_snapshot)
+        updated_at = _default_chain_updated_at
+        error = _default_chain_error
+
+    interval = _feed_refresh_interval_seconds
+    age = (
+        max(0.0, (datetime.now(UTC) - updated_at).total_seconds())
+        if updated_at is not None
+        else float("inf")
+    )
+    effective_market_status = market_status or "UNKNOWN"
+    if effective_market_status != "OPEN":
+        data_status = (
+            "closed" if effective_market_status != "UNKNOWN" else "unavailable"
+        )
+    elif age <= interval * 2:
+        data_status = "live"
+    else:
+        data_status = "stale"
+    if error and effective_market_status == "OPEN":
+        data_status = "stale"
+    result["data_status"] = data_status
+    result["market_status"] = effective_market_status
+    result["last_updated_at"] = updated_at.isoformat() if updated_at else None
+    result["data_error"] = error
+    return result
+
+
+def _refresh_default_chain_once(db: Session) -> str:
+    global _default_chain_snapshot, _default_chain_updated_at, _default_chain_error
+    with _default_chain_refresh_lock:
+        connection = db.scalar(
+            select(BrokerConnection).where(BrokerConnection.provider == "fyers")
+        )
+        if connection is None:
+            with _default_chain_state_lock:
+                _default_chain_error = "The market-data account is not connected."
+            return "UNAVAILABLE"
+
+        try:
+            access_token = _get_access_token(connection, db)
+            market_status = _fyers_option_market_status(access_token, db)["status"]
+            if market_status != "OPEN":
+                with _default_chain_state_lock:
+                    _default_chain_error = None
+                return market_status
+
+            symbol = "NSE:NIFTY50-INDEX"
+            chain_data = _fyers_data(
+                "options-chain-v3",
+                {"symbol": symbol, "strikecount": "50", "greeks": "1"},
+                access_token,
+            )
+            expiries = _normalize_expiries(chain_data.get("expiryData"))
+            selected_expiry = expiries[0]["timestamp"] if expiries else None
+            response = {
+                "symbol": symbol,
+                "expiries": expiries,
+                "selected_expiry": selected_expiry,
+                **_normalize_option_chain(chain_data),
+            }
+            if selected_expiry is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail="The provider returned no current NIFTY expiry.",
+                )
+            _shared_market_feed.cache_option_contracts(
+                symbol, selected_expiry, chain_data
+            )
+            now = datetime.now(UTC)
+            response["data_status"] = "live"
+            response["market_status"] = market_status
+            response["last_updated_at"] = now.isoformat()
+            response["data_error"] = None
+            with _default_chain_state_lock:
+                _default_chain_snapshot = copy.deepcopy(response)
+                _default_chain_updated_at = now
+                _default_chain_error = None
+            _shared_market_feed.cache_chain_snapshot(symbol, selected_expiry, response)
+            return market_status
+        except HTTPException as error:
+            with _default_chain_state_lock:
+                _default_chain_error = str(error.detail)
+            raise
+
+
+def _fyers_feed_poller() -> None:
+    failure_count = 0
+    while not _feed_poller_stop.is_set():
+        interval = 5
+        refresh_started_at = time.monotonic()
+        try:
+            with SessionLocal() as db:
+                interval = _feed_interval(db)
+                _refresh_default_chain_once(db)
+        except HTTPException as error:
+            failure_count += 1
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            try:
+                delay = (
+                    max(interval, int(retry_after))
+                    if retry_after
+                    else min(300, interval * 2 ** min(failure_count, 6))
+                )
+            except ValueError:
+                delay = min(300, interval * 2 ** min(failure_count, 6))
+            logger.warning("Shared NIFTY chain refresh paused: %s", error.detail)
+        except Exception:
+            failure_count += 1
+            delay = min(300, interval * 2 ** min(failure_count, 6))
+            logger.exception("Shared NIFTY chain refresh failed")
+        else:
+            failure_count = 0
+            delay = max(
+                0.0, interval - (time.monotonic() - refresh_started_at)
+            )
+        _feed_poller_stop.wait(delay)
+
+
+def start_fyers_feed_poller() -> None:
+    global _feed_poller_thread
+    if _feed_poller_thread is not None and _feed_poller_thread.is_alive():
+        return
+    _feed_poller_stop.clear()
+    _feed_poller_thread = threading.Thread(
+        target=_fyers_feed_poller, name="fyers-nifty-chain-poller", daemon=True
+    )
+    _feed_poller_thread.start()
+
+
+def stop_fyers_feed_poller() -> None:
+    global _feed_poller_thread
+    _feed_poller_stop.set()
+    if _feed_poller_thread is not None:
+        _feed_poller_thread.join(timeout=2)
+        _feed_poller_thread = None
 
 
 @router.get("/option-chain")
@@ -1587,6 +2099,33 @@ def fyers_option_chain(
 
     try:
         access_token = _get_access_token(connection, db)
+        market_status = _fyers_option_market_status(access_token, db)["status"]
+        is_nifty = symbol == "NSE:NIFTY50-INDEX"
+        default_snapshot = (
+            _default_chain_payload(market_status) if is_nifty else None
+        )
+        if default_snapshot is not None and (
+            timestamp is None or timestamp == default_snapshot["selected_expiry"]
+        ):
+            return _apply_option_chain_quotes(symbol, default_snapshot)
+
+        if market_status != "OPEN":
+            if cached_snapshot is not None:
+                cached_snapshot["data_status"] = "closed"
+                cached_snapshot["market_status"] = market_status
+                cached_snapshot["data_error"] = None
+                return _apply_option_chain_quotes(symbol, cached_snapshot)
+            raise HTTPException(
+                status_code=503,
+                detail="Market is closed; no fresh option-chain data is available.",
+            )
+
+        if is_nifty and timestamp is None:
+            _refresh_default_chain_once(db)
+            default_snapshot = _default_chain_payload(market_status)
+            if default_snapshot is not None:
+                return _apply_option_chain_quotes(symbol, default_snapshot)
+
         discovery_data = _fyers_data(
             "options-chain-v3",
             {
@@ -1623,6 +2162,10 @@ def fyers_option_chain(
             "selected_expiry": selected_expiry,
             **_normalize_option_chain(chain_data),
         }
+        response["data_status"] = "live"
+        response["market_status"] = market_status
+        response["last_updated_at"] = datetime.now(UTC).isoformat()
+        response["data_error"] = None
         if selected_expiry is not None:
             _shared_market_feed.cache_option_contracts(
                 symbol, selected_expiry, chain_data
@@ -1630,14 +2173,16 @@ def fyers_option_chain(
             _shared_market_feed.cache_chain_snapshot(
                 symbol, selected_expiry, response
             )
-        return _apply_cached_quotes(symbol, response)
+        return _apply_option_chain_quotes(symbol, response)
     except HTTPException as error:
         if error.status_code in {502, 503, 504} and cached_snapshot is not None:
             logger.warning(
-                "Serving cached option-chain snapshot for %s after provider failure",
-                symbol,
+                "Serving stale option-chain snapshot for %s after provider failure: %s",
+                symbol, error.detail
             )
-            return _apply_cached_quotes(symbol, cached_snapshot)
+            cached_snapshot["data_status"] = "stale"
+            cached_snapshot["data_error"] = str(error.detail)
+            return _apply_option_chain_quotes(symbol, cached_snapshot)
         raise
 
 
@@ -1892,6 +2437,56 @@ async def fyers_market_stream(
             )
 
 
+def _fyers_history_data(params: dict[str, str], access_token: str) -> dict:
+    key = tuple(sorted(params.items()))
+    with _history_response_lock:
+        now = time.monotonic()
+        expired = [
+            cache_key
+            for cache_key, (cached_at, _) in _history_response_cache.items()
+            if now - cached_at >= _HISTORY_RESPONSE_CACHE_TTL
+        ]
+        for cache_key in expired:
+            del _history_response_cache[cache_key]
+        cached = _history_response_cache.get(key)
+        if cached is not None:
+            _history_response_cache.move_to_end(key)
+            return copy.deepcopy(cached[1])
+
+        _ensure_fyers_api_available()
+        settings = get_settings()
+        try:
+            _record_fyers_api_request()
+            response = httpx.get(
+                f"{settings.fyers_api_base_url.rstrip('/')}/data/history",
+                params=params,
+                headers={
+                    "Authorization": f"{settings.fyers_client_id}:{access_token}"
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 429:
+                _raise_fyers_rate_limit(error, "history")
+            raise HTTPException(
+                status_code=502, detail="Historical market-data request failed"
+            ) from error
+        except (httpx.HTTPError, ValueError) as error:
+            raise HTTPException(
+                status_code=502, detail="Historical market-data request failed"
+            ) from error
+        if not isinstance(payload, dict) or payload.get("s") != "ok":
+            raise HTTPException(
+                status_code=502, detail="Historical market-data request failed"
+            )
+        _history_response_cache[key] = (time.monotonic(), copy.deepcopy(payload))
+        while len(_history_response_cache) > 256:
+            _history_response_cache.popitem(last=False)
+        return payload
+
+
 @router.get("/history")
 def fyers_history(
     symbol: str = Query(min_length=5, max_length=40),
@@ -1936,7 +2531,6 @@ def fyers_history(
             status_code=422, detail="Both range_from and range_to are required"
         )
     access_token = _get_access_token(connection, db)
-    settings = get_settings()
     if range_from is None or range_to is None:
         selected_from = (today - timedelta(days=lookback_days[resolution])).isoformat()
         selected_to = today.isoformat()
@@ -1954,28 +2548,17 @@ def fyers_history(
             )
         selected_from = range_from
         selected_to = range_to
-    try:
-        response = httpx.get(
-            f"{settings.fyers_api_base_url.rstrip('/')}/data/history",
-            params={
-                "symbol": symbol,
-                "resolution": resolution,
-                "date_format": "1",
-                "range_from": selected_from,
-                "range_to": selected_to,
-                "cont_flag": "1",
-            },
-            headers={
-                "Authorization": f"{settings.fyers_client_id}:{access_token}"
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError) as error:
-        raise HTTPException(
-            status_code=502, detail="Historical market-data request failed"
-        ) from error
+    payload = _fyers_history_data(
+        {
+            "symbol": symbol,
+            "resolution": resolution,
+            "date_format": "1",
+            "range_from": selected_from,
+            "range_to": selected_to,
+            "cont_flag": "1",
+        },
+        access_token,
+    )
     if not isinstance(payload, dict) or payload.get("s") != "ok":
         raise HTTPException(
             status_code=502, detail="Historical market-data request failed"

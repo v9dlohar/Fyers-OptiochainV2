@@ -273,6 +273,7 @@ export default function SpotChart({
   underlying,
   liveTick,
   historicalRange,
+  historicalCandles,
   historicalResolution,
   historicalSelectedTime,
   onHistoricalTimeSelect,
@@ -284,6 +285,7 @@ export default function SpotChart({
   underlying: Underlying | null;
   liveTick: LiveTick | null;
   historicalRange?: { from: string; to: string };
+  historicalCandles?: Candle[];
   historicalResolution?: Resolution;
   historicalSelectedTime?: number | null;
   onHistoricalTimeSelect?: (time: number) => void;
@@ -367,6 +369,16 @@ export default function SpotChart({
   }, []);
 
   useEffect(() => {
+    if (historicalCandles !== undefined) {
+      requestVersion.current += 1;
+      return;
+    }
+
+    if (!chartOpen && !forceOpen) {
+      requestVersion.current += 1;
+      return;
+    }
+
     if (!underlying) {
       requestVersion.current += 1;
       return;
@@ -404,7 +416,17 @@ export default function SpotChart({
     return () => {
       requestVersion.current += 1;
     };
-  }, [activeResolution, apiRequest, historicalFrom, historicalTo, requestKey, underlying]);
+  }, [
+    activeResolution,
+    apiRequest,
+    chartOpen,
+    forceOpen,
+    historicalCandles,
+    historicalFrom,
+    historicalTo,
+    requestKey,
+    underlying,
+  ]);
 
   useEffect(() => {
     if (!chartApi || !onHistoricalTimeSelect) return;
@@ -564,7 +586,11 @@ export default function SpotChart({
     };
   }, []);
 
-  const currentHistory = history?.key === requestKey ? history : null;
+  const currentHistory = historicalCandles !== undefined
+    ? { key: requestKey, candles: historicalCandles, error: "" }
+    : history?.key === requestKey
+      ? history
+      : null;
   const candles = currentHistory?.candles ?? EMPTY_CANDLES;
   const replayIndex = replayTime === null
     ? null

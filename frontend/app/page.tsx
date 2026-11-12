@@ -52,6 +52,13 @@ type FyersProfileDetails = {
   fyersId: string | null;
 };
 
+type FyersApiUsage = {
+  date: string;
+  daily_limit: number;
+  requests_used: number;
+  requests_remaining: number;
+};
+
 class ApiRequestError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -127,6 +134,11 @@ export default function HomePage() {
   const [fyersError, setFyersError] = useState("");
   const [fyersProfileChecked, setFyersProfileChecked] = useState(false);
   const [fyersProfile, setFyersProfile] = useState<FyersProfileDetails | null>(null);
+  const [fyersRefreshInterval, setFyersRefreshInterval] = useState(5);
+  const [feedSettingsSaving, setFeedSettingsSaving] = useState(false);
+  const [feedSettingsError, setFeedSettingsError] = useState("");
+  const [fyersApiUsage, setFyersApiUsage] = useState<FyersApiUsage | null>(null);
+  const [fyersApiUsageError, setFyersApiUsageError] = useState("");
   const [theme, setTheme] = useState<ThemeId>("glossy-milk");
   const [themeLoaded, setThemeLoaded] = useState(false);
 
@@ -200,6 +212,77 @@ export default function HomePage() {
         setFyersLoading(false);
       }
     })();
+  }, [user]);
+
+  useEffect(() => {
+    if (!user?.is_admin) return;
+    let active = true;
+    const loadUsage = async () => {
+      try {
+        const value: unknown = await request("/api/admin/fyers/api-usage");
+        if (
+          !isRecord(value) ||
+          typeof value.date !== "string" ||
+          typeof value.daily_limit !== "number" ||
+          typeof value.requests_used !== "number" ||
+          typeof value.requests_remaining !== "number"
+        ) {
+          throw new Error("The daily Fyers API usage response is invalid.");
+        }
+        if (active) {
+          setFyersApiUsage({
+            date: value.date,
+            daily_limit: value.daily_limit,
+            requests_used: value.requests_used,
+            requests_remaining: value.requests_remaining,
+          });
+          setFyersApiUsageError("");
+        }
+      } catch (caught) {
+        if (active) {
+          setFyersApiUsageError(
+            userFacingError(caught, "Unable to load daily Fyers API usage."),
+          );
+        }
+      }
+    };
+    void loadUsage();
+    const timer = window.setInterval(() => void loadUsage(), 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || (!user.is_admin && !user.license_active)) return;
+    let active = true;
+    let loaded = false;
+    const loadSettings = () => {
+      request("/api/admin/fyers/feed-settings")
+        .then((value) => {
+        if (!isRecord(value) || typeof value.refresh_interval_seconds !== "number") {
+          throw new Error("The shared feed interval is invalid.");
+        }
+        if (active && value.refresh_interval_seconds >= 1 && value.refresh_interval_seconds <= 5) {
+          setFyersRefreshInterval(value.refresh_interval_seconds);
+        }
+        loaded = true;
+      })
+        .catch((caught: unknown) => {
+          if (active && user.is_admin && !loaded) {
+            setFeedSettingsError(
+              caught instanceof Error ? caught.message : "Unable to load feed settings.",
+            );
+          }
+        });
+    };
+    loadSettings();
+    const timer = window.setInterval(loadSettings, 30_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, [user]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -307,6 +390,29 @@ export default function HomePage() {
       setFyersError(userFacingError(caught, "Unable to verify the market account."));
     } finally {
       setFyersLoading(false);
+    }
+  }
+
+  async function saveFyersRefreshInterval() {
+    setFeedSettingsSaving(true);
+    setFeedSettingsError("");
+    try {
+      const value = await request("/api/admin/fyers/feed-settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          refresh_interval_seconds: fyersRefreshInterval,
+        }),
+      });
+      if (!isRecord(value) || typeof value.refresh_interval_seconds !== "number") {
+        throw new Error("The shared feed interval could not be saved.");
+      }
+      setFyersRefreshInterval(value.refresh_interval_seconds);
+    } catch (caught) {
+      setFeedSettingsError(
+        caught instanceof Error ? caught.message : "Unable to save feed settings.",
+      );
+    } finally {
+      setFeedSettingsSaving(false);
     }
   }
 
@@ -441,8 +547,72 @@ export default function HomePage() {
                     </button>
                   </>
                 )}
+                {fyers?.connected && (
+                  <>
+                    <span className={styles.connectionStatus}>
+                      NIFTY default expiry · 1 request per interval
+                    </span>
+                    <label className={styles.themePicker}>
+                      <span>Chain refresh</span>
+                      <select
+                        aria-label="Shared NIFTY option-chain refresh interval"
+                        value={fyersRefreshInterval}
+                        onChange={(event) => {
+                          const interval = Number(event.target.value);
+                          if (interval >= 1 && interval <= 5) setFyersRefreshInterval(interval);
+                        }}
+                      >
+                        {[1, 2, 3, 4, 5].map((interval) => (
+                          <option key={interval} value={interval}>{interval} second{interval === 1 ? "" : "s"}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      className={styles.subtleButton}
+                      onClick={() => void saveFyersRefreshInterval()}
+                      disabled={feedSettingsSaving}
+                    >
+                      {feedSettingsSaving ? "Saving…" : "Save interval"}
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className={styles.apiUsagePanel}>
+                <strong>Fyers API requests today (IST)</strong>
+                {fyersApiUsageError ? (
+                  <p className={styles.connectionError} role="alert">{fyersApiUsageError}</p>
+                ) : fyersApiUsage ? (
+                  <>
+                    <p className={styles.apiUsageDate}>{fyersApiUsage.date}</p>
+                    <table className={styles.apiUsageTable}>
+                      <thead>
+                        <tr>
+                          <th scope="col">Daily limit</th>
+                          <th scope="col">Used</th>
+                          <th scope="col">Remaining</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td>{fyersApiUsage.daily_limit.toLocaleString()}</td>
+                          <td>{fyersApiUsage.requests_used.toLocaleString()}</td>
+                          <td>{fyersApiUsage.requests_remaining.toLocaleString()}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <p className={styles.apiUsageNote}>
+                      Counts outbound REST API requests sent to Fyers, including failed attempts;
+                      cached responses and WebSocket ticks are not counted. This is a monitor, not
+                      an automatic request cap. Tracking starts with this deployment and does not
+                      backfill requests made earlier today.
+                    </p>
+                  </>
+                ) : (
+                  <p className={styles.apiUsageDate} role="status">Loading usage…</p>
+                )}
               </div>
               {fyersError && <p className={styles.connectionError} role="alert">{fyersError}</p>}
+              {feedSettingsError && <p className={styles.connectionError} role="alert">{feedSettingsError}</p>}
               {fyersProfileChecked && (
                 <div className={styles.connectionVerified} role="status" aria-live="polite">
                   <strong>Verified</strong>
@@ -487,7 +657,10 @@ export default function HomePage() {
               />
             </section>
           ) : fyers?.connected ? (
-            <OptionChainWorkspace apiRequest={request} />
+            <OptionChainWorkspace
+              apiRequest={request}
+              refreshIntervalSeconds={fyersRefreshInterval}
+            />
           ) : user.is_admin ? (
             <section className={styles.connectPrompt}>
               <span className={styles.promptIcon} aria-hidden="true">↗</span>

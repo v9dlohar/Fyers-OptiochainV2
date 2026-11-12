@@ -77,6 +77,10 @@ class FyersStatus(BaseModel):
     connected_at: datetime | None = None
 
 
+class FyersFeedSettingsUpdate(BaseModel):
+    refresh_interval_seconds: int = Field(ge=1, le=5)
+
+
 class OptionChainResponse(BaseModel):
     provider: str
     symbol: str
